@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+facenet-pytorch
+pillow
+scikit-learn
+opencv-python
+python-multipart
+numpy
