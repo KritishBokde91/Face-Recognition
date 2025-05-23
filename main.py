@@ -3,21 +3,20 @@ import torch
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from facenet_pytorch import MTCNN, InceptionResnetV1
-from sklearn.metrics.pairwise import cosine_similarity
 import io
 from PIL import Image
 import threading
 import time
-import queue
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-import base64
-import atexit
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Force CPU usage and reduce memory
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+torch.set_num_threads(1)
 
 def convert_numpy_types(obj):
     """Convert numpy types to Python native types for JSON serialization"""
@@ -35,9 +34,9 @@ def convert_numpy_types(obj):
         return [convert_numpy_types(item) for item in obj]
     return obj
 
-app = FastAPI()
+app = FastAPI(title="Face Recognition API", version="1.0.0")
 
-# Enhanced CORS configuration
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,33 +46,70 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
-# Initialize models with error handling
-try:
-    device = torch.device('cpu')
-    mtcnn = MTCNN(image_size=160, margin=0, keep_all=False, post_process=False, device=device)
-    model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-    logger.info(f"Models loaded successfully on {device}")
-except Exception as e:
-    logger.error(f"Failed to load models: {str(e)}")
-    raise
-
-# Global variables with thread safety
+# Global variables
 reference_embedding = None
 lock = threading.Lock()
+models_loaded = False
+mtcnn = None
+model = None
+
+def lazy_load_models():
+    """Load models only when needed"""
+    global mtcnn, model, models_loaded
+    
+    if models_loaded:
+        return True
+        
+    try:
+        logger.info("Loading models...")
+        
+        # Import here to delay loading
+        from facenet_pytorch import MTCNN, InceptionResnetV1
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        device = torch.device('cpu')
+        
+        # Load with minimal settings
+        mtcnn = MTCNN(
+            image_size=160, 
+            margin=0, 
+            keep_all=False, 
+            post_process=False, 
+            device=device,
+            select_largest=True,
+            min_face_size=20  # Faster detection
+        )
+        
+        model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+        
+        # Optimize for inference
+        torch.set_grad_enabled(False)
+        
+        models_loaded = True
+        logger.info("Models loaded successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to load models: {str(e)}")
+        return False
 
 def get_face_embedding(img):
-    """Detect face and return embedding with error handling"""
+    """Detect face and return embedding"""
+    if not lazy_load_models():
+        return None
+        
     try:
-        # Convert PIL Image to RGB if needed
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-        # Detect face
+        # Resize image if too large (save memory)
+        if img.size[0] > 640 or img.size[1] > 640:
+            img.thumbnail((640, 640), Image.Resampling.LANCZOS)
+            
         face = mtcnn(img)
         if face is not None:
-            # Normalize face tensor
             face = (face - 127.5) / 128.0
-            with torch.no_grad():  # Prevent gradient computation
+            with torch.no_grad():
                 face_embedding = model(face.unsqueeze(0))
             return face_embedding.detach().cpu().numpy()
         return None
@@ -82,12 +118,16 @@ def get_face_embedding(img):
         return None
 
 def match_faces(embedding1, embedding2, threshold=0.6):
-    """Compare embeddings with error handling"""
+    """Compare embeddings"""
+    if not lazy_load_models():
+        return False, 0.0
+        
     try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        
         if embedding1 is None or embedding2 is None:
             return False, 0.0
         similarity = cosine_similarity(embedding1, embedding2)
-        # Convert numpy types to Python native types for JSON serialization
         is_match = bool(similarity[0][0] > threshold)
         score = float(similarity[0][0])
         return is_match, score
@@ -95,25 +135,45 @@ def match_faces(embedding1, embedding2, threshold=0.6):
         logger.error(f"Error in face matching: {str(e)}")
         return False, 0.0
 
-# Add test connection endpoint
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Face Recognition API",
+        "status": "running",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "models_loaded": models_loaded,
+        "timestamp": time.time()
+    }
+
 @app.get("/test_connection")
 async def test_connection():
-    """Test endpoint for connection verification"""
-    return {"status": "connected", "timestamp": float(time.time())}
+    """Test endpoint"""
+    return {
+        "status": "connected", 
+        "timestamp": float(time.time()),
+        "server": "railway"
+    }
 
 @app.post("/upload_reference_image/")
 async def upload_reference_image(file: UploadFile = File(...)):
-    """Handle reference image upload with proper validation"""
+    """Handle reference image upload"""
     global reference_embedding
     
-    logger.info(f"Received upload request for reference file: {file.filename}")
+    logger.info(f"Processing reference image: {file.filename}")
     
     try:
-        # Validate file type
+        # Validate file
         if not file.content_type or not file.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="File must be an image")
         
-        # Read and verify image
         contents = await file.read()
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
@@ -121,22 +181,22 @@ async def upload_reference_image(file: UploadFile = File(...)):
         if len(contents) > 5 * 1024 * 1024:  # 5MB limit
             raise HTTPException(status_code=413, detail="File too large (max 5MB)")
             
+        # Process image
         try:
             image = Image.open(io.BytesIO(contents))
-            if image.mode not in ['RGB', 'L', 'RGBA']:
-                image = image.convert('RGB')
-            elif image.mode == 'RGBA':
-                # Handle transparency by creating white background
+            if image.mode == 'RGBA':
                 background = Image.new('RGB', image.size, (255, 255, 255))
                 background.paste(image, mask=image.split()[-1])
                 image = background
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
             
-        # Process face
+        # Get embedding
         embedding = get_face_embedding(image)
         if embedding is None:
-            raise HTTPException(status_code=400, detail="No face detected in the reference image")
+            raise HTTPException(status_code=400, detail="No face detected in reference image")
             
         with lock:
             reference_embedding = embedding
@@ -144,44 +204,43 @@ async def upload_reference_image(file: UploadFile = File(...)):
         return {
             "status": "success",
             "message": "Reference image processed successfully",
-            "image_size": image.size,
-            "image_mode": image.mode
+            "image_size": image.size
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload error: {str(e)}", exc_info=True)
+        logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/process_frame/")
 async def process_frame(file: UploadFile = File(...)):
-    """Process frame from mobile camera and return match result"""
+    """Process frame and return match result"""
     if reference_embedding is None:
         raise HTTPException(status_code=400, detail="No reference image uploaded")
     
     try:
-        # Validate file type
+        # Validate file
         if not file.content_type or not file.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="File must be an image")
         
-        # Read image
         contents = await file.read()
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
             
+        # Process image
         try:
             image = Image.open(io.BytesIO(contents))
-            if image.mode not in ['RGB', 'L', 'RGBA']:
-                image = image.convert('RGB')
-            elif image.mode == 'RGBA':
+            if image.mode == 'RGBA':
                 background = Image.new('RGB', image.size, (255, 255, 255))
                 background.paste(image, mask=image.split()[-1])
                 image = background
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
         
-        # Get face embedding from current frame
+        # Get embedding and compare
         embedding = get_face_embedding(image)
         
         if embedding is not None:
@@ -200,9 +259,7 @@ async def process_frame(file: UploadFile = File(...)):
                 "face_detected": False
             }
         
-        # Ensure all numpy types are converted
-        result = convert_numpy_types(result)
-        return result
+        return convert_numpy_types(result)
         
     except HTTPException:
         raise
@@ -210,29 +267,14 @@ async def process_frame(file: UploadFile = File(...)):
         logger.error(f"Frame processing error: {str(e)}")
         raise HTTPException(status_code=500, detail="Error processing frame")
 
-# Keep the old endpoint for backward compatibility (but it won't be used)
-@app.get("/get_match_result/")
-async def get_match_result():
-    """Legacy endpoint - returns empty result"""
-    if reference_embedding is None:
-        raise HTTPException(status_code=400, detail="No reference image uploaded")
-        
-    return {
-        "match": False,
-        "score": 0.0,
-        "message": "Use mobile camera for live processing",
-        "timestamp": float(time.time()),
-        "face_detected": False
-    }
-
 @app.get("/status/")
 async def get_status():
     """Check service status"""
     return {
         "status": "running",
         "reference_loaded": reference_embedding is not None,
-        "device": str(device),
-        "model_loaded": True
+        "device": "cpu",
+        "model_loaded": models_loaded
     }
 
 @app.delete("/clear_reference/")
@@ -243,6 +285,15 @@ async def clear_reference():
         reference_embedding = None
     return {"status": "success", "message": "Reference image cleared"}
 
+# Railway deployment
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        workers=1,  # Single worker to save memory
+        timeout_keep_alive=30
+    )
