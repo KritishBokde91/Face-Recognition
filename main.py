@@ -9,11 +9,8 @@ import io
 from PIL import Image
 import threading
 import time
-import queue
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-import base64
-import atexit
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,340 +37,209 @@ def convert_numpy_types(obj):
 
 app = FastAPI(
     title="Face Recognition API",
-    description="Face recognition service for deployment",
+    description="Face recognition service",
     version="1.0.0"
 )
 
-# Enhanced CORS configuration
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
+    allow_headers=["*"]
 )
 
-# Global variables for lazy loading
+# Initialize models once at startup
+device = torch.device('cpu')
+models_loaded = False
 mtcnn = None
 model = None
-device = None
-models_loaded = False
-model_lock = threading.Lock()
 
-def load_models():
-    """Lazy load models to save memory"""
-    global mtcnn, model, device, models_loaded
-    
-    if models_loaded:
-        return True
-        
+@app.on_event("startup")
+async def load_models():
+    global mtcnn, model, models_loaded
     try:
-        with model_lock:
-            if models_loaded:  # Double-check pattern
-                return True
-                
-            logger.info("Loading models...")
+        logger.info("Loading models...")
+        
+        # Initialize with minimal settings
+        mtcnn = MTCNN(
+            image_size=112,
+            margin=0,
+            keep_all=False,
+            post_process=False,
+            device=device,
+            min_face_size=40,
+            thresholds=[0.7, 0.8, 0.9]
+        )
+        
+        model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+        
+        # Freeze model and optimize
+        for param in model.parameters():
+            param.requires_grad = False
             
-            # Force CPU usage and optimize memory
-            device = torch.device('cpu')
-            torch.set_num_threads(1)  # Limit CPU threads
-            
-            # Initialize with minimal memory footprint
-            mtcnn = MTCNN(
-                image_size=112,  # Smaller size to save memory
-                margin=0, 
-                keep_all=False, 
-                post_process=False, 
-                device=device,
-                min_face_size=40,  # Larger min face to reduce processing
-                thresholds=[0.7, 0.8, 0.9]  # Higher thresholds for efficiency
-            )
-            
-            model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-            
-            # Enable memory optimizations
-            if hasattr(torch.backends, 'cudnn'):
-                torch.backends.cudnn.benchmark = False
-                torch.backends.cudnn.deterministic = True
-            
-            models_loaded = True
-            logger.info(f"Models loaded successfully on {device}")
-            return True
-            
+        torch.set_grad_enabled(False)
+        models_loaded = True
+        logger.info(f"Models loaded successfully on {device}")
+        
     except Exception as e:
         logger.error(f"Failed to load models: {str(e)}")
-        return False
+        raise
 
 # Global variables with thread safety
 reference_embedding = None
 lock = threading.Lock()
 
 def get_face_embedding(img):
-    """Detect face and return embedding with error handling and memory optimization"""
-    global mtcnn, model
-    
-    # Load models if not already loaded
-    if not load_models():
-        return None
-        
+    """Detect face and return embedding"""
     try:
-        # Convert PIL Image to RGB if needed
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-        # Resize image more aggressively to save memory
-        max_size = 640  # Reduced from 1024
+        # Resize to save memory
+        max_size = 512
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-        # Detect face with memory management
-        with torch.no_grad():
-            face = mtcnn(img)
-            
+        # Detect face
+        face = mtcnn(img)
         if face is not None:
-            # Normalize face tensor
             face = (face - 127.5) / 128.0
-            with torch.no_grad():
-                face_embedding = model(face.unsqueeze(0))
-            
-            # Immediately move to CPU and cleanup
-            result = face_embedding.detach().cpu().numpy()
-            del face_embedding, face
-            return result
-            
+            embedding = model(face.unsqueeze(0))
+            return embedding.detach().cpu().numpy()
         return None
-        
     except Exception as e:
-        logger.error(f"Error in face embedding: {str(e)}")
+        logger.error(f"Face embedding error: {str(e)}")
         return None
-    finally:
-        # Aggressive memory cleanup
-        if 'face' in locals():
-            del face
-        if 'face_embedding' in locals():
-            del face_embedding
-        # Force garbage collection
-        import gc
-        gc.collect()
 
 def match_faces(embedding1, embedding2, threshold=0.6):
-    """Compare embeddings with error handling"""
+    """Compare face embeddings"""
     try:
         if embedding1 is None or embedding2 is None:
             return False, 0.0
         similarity = cosine_similarity(embedding1, embedding2)
-        # Convert numpy types to Python native types for JSON serialization
-        is_match = bool(similarity[0][0] > threshold)
-        score = float(similarity[0][0])
-        return is_match, score
+        return bool(similarity[0][0] > threshold), float(similarity[0][0])
     except Exception as e:
-        logger.error(f"Error in face matching: {str(e)}")
+        logger.error(f"Matching error: {str(e)}")
         return False, 0.0
 
-# Health check endpoint for Render
 @app.get("/")
-async def root():
-    """Root endpoint for health checks - loads models on first access"""
-    # Try to load models on first health check
-    models_ready = load_models() if not models_loaded else True
-    
+async def health_check():
     return {
-        "status": "healthy" if models_ready else "loading",
-        "service": "Face Recognition API",
-        "version": "1.0.0",
+        "status": "running",
         "models_loaded": models_loaded,
-        "timestamp": float(time.time())
+        "reference_loaded": reference_embedding is not None
     }
 
-# Add test connection endpoint
 @app.get("/test_connection")
 async def test_connection():
-    """Test endpoint for connection verification"""
-    return {"status": "connected", "timestamp": float(time.time())}
+    return {"status": "connected", "timestamp": time.time()}
 
 @app.post("/upload_reference_image/")
 async def upload_reference_image(file: UploadFile = File(...)):
-    """Handle reference image upload with proper validation"""
     global reference_embedding
     
-    logger.info(f"Received upload request for reference file: {file.filename}")
-    
     try:
-        # Validate file type
-        if not file.content_type or not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Read and verify image
+        # Validate input
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(400, "File must be an image")
+            
+        # Read image with size limit
         contents = await file.read()
-        if len(contents) == 0:
-            raise HTTPException(status_code=400, detail="Empty file")
+        if len(contents) > 1 * 1024 * 1024:  # 1MB
+            raise HTTPException(413, "File too large (max 1MB)")
             
-        # Reduced file size limit for Render's memory constraints
-        if len(contents) > 1 * 1024 * 1024:  # 1MB limit - much smaller
-            raise HTTPException(status_code=413, detail="File too large (max 1MB)")
+        image = Image.open(io.BytesIO(contents))
+        if max(image.size) > 512:
+            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
             
-        try:
-            image = Image.open(io.BytesIO(contents))
-            # Immediately resize to save memory
-            if max(image.size) > 512:
-                image.thumbnail((512, 512), Image.Resampling.LANCZOS)
-                
-            if image.mode not in ['RGB', 'L', 'RGBA']:
-                image = image.convert('RGB')
-            elif image.mode == 'RGBA':
-                # Handle transparency by creating white background
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                background.paste(image, mask=image.split()[-1])
-                image = background
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+        if image.mode == 'RGBA':
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[-1])
+            image = background
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
             
-        # Process face
+        # Process image
         embedding = get_face_embedding(image)
         if embedding is None:
-            raise HTTPException(status_code=400, detail="No face detected in the reference image")
+            raise HTTPException(400, "No face detected")
             
         with lock:
             reference_embedding = embedding
             
         return {
             "status": "success",
-            "message": "Reference image processed successfully",
-            "image_size": image.size,
-            "image_mode": image.mode
+            "message": "Reference image processed"
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-    finally:
-        # Clean up memory
-        if 'contents' in locals():
-            del contents
-        if 'image' in locals():
-            del image
+        logger.error(f"Upload error: {str(e)}")
+        raise HTTPException(500, "Internal server error")
 
 @app.post("/process_frame/")
 async def process_frame(file: UploadFile = File(...)):
-    """Process frame from mobile camera and return match result"""
     if reference_embedding is None:
-        raise HTTPException(status_code=400, detail="No reference image uploaded")
+        raise HTTPException(400, "No reference image uploaded")
     
     try:
-        # Validate file type
-        if not file.content_type or not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Read image
+        # Validate input
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(400, "File must be an image")
+            
         contents = await file.read()
-        if len(contents) == 0:
-            raise HTTPException(status_code=400, detail="Empty file")
+        if len(contents) > 800 * 1024:  # 800KB
+            raise HTTPException(413, "Frame too large (max 800KB)")
             
-        # File size limit for frames - very small
-        if len(contents) > 800 * 1024:  # 800KB limit for frames
-            raise HTTPException(status_code=413, detail="Frame too large (max 800KB)")
+        image = Image.open(io.BytesIO(contents))
+        if max(image.size) > 400:
+            image.thumbnail((400, 400), Image.Resampling.LANCZOS)
             
-        try:
-            image = Image.open(io.BytesIO(contents))
-            # Aggressively resize frames
-            if max(image.size) > 400:
-                image.thumbnail((400, 400), Image.Resampling.LANCZOS)
-                
-            if image.mode not in ['RGB', 'L', 'RGBA']:
-                image = image.convert('RGB')
-            elif image.mode == 'RGBA':
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                background.paste(image, mask=image.split()[-1])
-                image = background
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-        
-        # Get face embedding from current frame
+        if image.mode == 'RGBA':
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[-1])
+            image = background
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
+            
+        # Process frame
         embedding = get_face_embedding(image)
         
         if embedding is not None:
             is_match, score = match_faces(reference_embedding, embedding)
             result = {
-                "match": bool(is_match),
-                "score": float(score),
-                "timestamp": float(time.time()),
+                "match": is_match,
+                "score": score,
+                "timestamp": time.time(),
                 "face_detected": True
             }
         else:
             result = {
                 "match": False,
                 "score": 0.0,
-                "timestamp": float(time.time()),
+                "timestamp": time.time(),
                 "face_detected": False
             }
-        
-        # Ensure all numpy types are converted
-        result = convert_numpy_types(result)
-        return result
+            
+        return convert_numpy_types(result)
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Frame processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error processing frame")
-    finally:
-        # Clean up memory
-        if 'contents' in locals():
-            del contents
-        if 'image' in locals():
-            del image
-
-# Keep the old endpoint for backward compatibility (but it won't be used)
-@app.get("/get_match_result/")
-async def get_match_result():
-    """Legacy endpoint - returns empty result"""
-    if reference_embedding is None:
-        raise HTTPException(status_code=400, detail="No reference image uploaded")
-        
-    return {
-        "match": False,
-        "score": 0.0,
-        "message": "Use mobile camera for live processing",
-        "timestamp": float(time.time()),
-        "face_detected": False
-    }
-
-@app.get("/status/")
-async def get_status():
-    """Check service status"""
-    return {
-        "status": "running",
-        "reference_loaded": reference_embedding is not None,
-        "device": str(device) if device else "not loaded",
-        "models_loaded": models_loaded,
-        "memory_info": {
-            "reference_embedding_loaded": reference_embedding is not None
-        }
-    }
+        raise HTTPException(500, "Error processing frame")
 
 @app.delete("/clear_reference/")
 async def clear_reference():
-    """Clear reference image"""
     global reference_embedding
     with lock:
         reference_embedding = None
-    return {"status": "success", "message": "Reference image cleared"}
-
-# Health check endpoint specifically for Render
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    return {
-        "status": "healthy",
-        "timestamp": float(time.time()),
-        "service": "Face Recognition API"
-    }
+    return {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Get port from environment variable (Render provides this)
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=30)
