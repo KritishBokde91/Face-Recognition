@@ -54,31 +54,56 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
-# Initialize models with error handling and memory optimization
-try:
-    # Force CPU usage for Render's environment
-    device = torch.device('cpu')
+# Global variables for lazy loading
+mtcnn = None
+model = None
+device = None
+models_loaded = False
+model_lock = threading.Lock()
+
+def load_models():
+    """Lazy load models to save memory"""
+    global mtcnn, model, device, models_loaded
     
-    # Initialize with memory-efficient settings
-    mtcnn = MTCNN(
-        image_size=160, 
-        margin=0, 
-        keep_all=False, 
-        post_process=False, 
-        device=device,
-        min_face_size=20,  # Optimize for smaller faces
-        thresholds=[0.6, 0.7, 0.8]  # Default thresholds
-    )
-    
-    model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-    
-    # Set memory optimization
-    torch.set_num_threads(1)  # Limit CPU threads for Render
-    
-    logger.info(f"Models loaded successfully on {device}")
-except Exception as e:
-    logger.error(f"Failed to load models: {str(e)}")
-    raise
+    if models_loaded:
+        return True
+        
+    try:
+        with model_lock:
+            if models_loaded:  # Double-check pattern
+                return True
+                
+            logger.info("Loading models...")
+            
+            # Force CPU usage and optimize memory
+            device = torch.device('cpu')
+            torch.set_num_threads(1)  # Limit CPU threads
+            
+            # Initialize with minimal memory footprint
+            mtcnn = MTCNN(
+                image_size=112,  # Smaller size to save memory
+                margin=0, 
+                keep_all=False, 
+                post_process=False, 
+                device=device,
+                min_face_size=40,  # Larger min face to reduce processing
+                thresholds=[0.7, 0.8, 0.9]  # Higher thresholds for efficiency
+            )
+            
+            model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+            
+            # Enable memory optimizations
+            if hasattr(torch.backends, 'cudnn'):
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+            
+            models_loaded = True
+            logger.info(f"Models loaded successfully on {device}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Failed to load models: {str(e)}")
+        return False
 
 # Global variables with thread safety
 reference_embedding = None
@@ -86,18 +111,24 @@ lock = threading.Lock()
 
 def get_face_embedding(img):
     """Detect face and return embedding with error handling and memory optimization"""
+    global mtcnn, model
+    
+    # Load models if not already loaded
+    if not load_models():
+        return None
+        
     try:
         # Convert PIL Image to RGB if needed
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-        # Resize image if too large to save memory
-        max_size = 1024
+        # Resize image more aggressively to save memory
+        max_size = 640  # Reduced from 1024
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-        # Detect face
-        with torch.no_grad():  # Prevent gradient computation
+        # Detect face with memory management
+        with torch.no_grad():
             face = mtcnn(img)
             
         if face is not None:
@@ -105,16 +136,26 @@ def get_face_embedding(img):
             face = (face - 127.5) / 128.0
             with torch.no_grad():
                 face_embedding = model(face.unsqueeze(0))
-            return face_embedding.detach().cpu().numpy()
+            
+            # Immediately move to CPU and cleanup
+            result = face_embedding.detach().cpu().numpy()
+            del face_embedding, face
+            return result
+            
         return None
+        
     except Exception as e:
         logger.error(f"Error in face embedding: {str(e)}")
         return None
     finally:
-        # Clean up memory
+        # Aggressive memory cleanup
         if 'face' in locals():
             del face
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if 'face_embedding' in locals():
+            del face_embedding
+        # Force garbage collection
+        import gc
+        gc.collect()
 
 def match_faces(embedding1, embedding2, threshold=0.6):
     """Compare embeddings with error handling"""
@@ -133,11 +174,15 @@ def match_faces(embedding1, embedding2, threshold=0.6):
 # Health check endpoint for Render
 @app.get("/")
 async def root():
-    """Root endpoint for health checks"""
+    """Root endpoint for health checks - loads models on first access"""
+    # Try to load models on first health check
+    models_ready = load_models() if not models_loaded else True
+    
     return {
-        "status": "healthy",
+        "status": "healthy" if models_ready else "loading",
         "service": "Face Recognition API",
         "version": "1.0.0",
+        "models_loaded": models_loaded,
         "timestamp": float(time.time())
     }
 
@@ -165,11 +210,15 @@ async def upload_reference_image(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Empty file")
             
         # Reduced file size limit for Render's memory constraints
-        if len(contents) > 3 * 1024 * 1024:  # 3MB limit
-            raise HTTPException(status_code=413, detail="File too large (max 3MB)")
+        if len(contents) > 1 * 1024 * 1024:  # 1MB limit - much smaller
+            raise HTTPException(status_code=413, detail="File too large (max 1MB)")
             
         try:
             image = Image.open(io.BytesIO(contents))
+            # Immediately resize to save memory
+            if max(image.size) > 512:
+                image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                
             if image.mode not in ['RGB', 'L', 'RGBA']:
                 image = image.convert('RGB')
             elif image.mode == 'RGBA':
@@ -223,12 +272,16 @@ async def process_frame(file: UploadFile = File(...)):
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
             
-        # File size limit for frames
-        if len(contents) > 2 * 1024 * 1024:  # 2MB limit for frames
-            raise HTTPException(status_code=413, detail="Frame too large (max 2MB)")
+        # File size limit for frames - very small
+        if len(contents) > 800 * 1024:  # 800KB limit for frames
+            raise HTTPException(status_code=413, detail="Frame too large (max 800KB)")
             
         try:
             image = Image.open(io.BytesIO(contents))
+            # Aggressively resize frames
+            if max(image.size) > 400:
+                image.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                
             if image.mode not in ['RGB', 'L', 'RGBA']:
                 image = image.convert('RGB')
             elif image.mode == 'RGBA':
@@ -294,8 +347,8 @@ async def get_status():
     return {
         "status": "running",
         "reference_loaded": reference_embedding is not None,
-        "device": str(device),
-        "model_loaded": True,
+        "device": str(device) if device else "not loaded",
+        "models_loaded": models_loaded,
         "memory_info": {
             "reference_embedding_loaded": reference_embedding is not None
         }
